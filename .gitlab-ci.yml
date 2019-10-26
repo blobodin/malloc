@@ -1,0 +1,2 @@
+malloc:
+    script: "/testers/cs24/project04/malloc/test"
