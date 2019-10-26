@@ -84,6 +84,8 @@ double get_counter()
 /* Get the clock rate from /proc */
 double mhz_full(int verbose, int sleeptime)
 {
+    (void) sleeptime;
+
     static char buf[2048];
 
     FILE *fp = fopen("/proc/cpuinfo", "r");

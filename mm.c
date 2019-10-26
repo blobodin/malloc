@@ -96,6 +96,7 @@ void *malloc(size_t size) {
  *      Computers have big memories; surely it won't be a problem.
  */
 void free(void *ptr) {
+    (void) ptr;
 }
 
 /*
@@ -155,4 +156,5 @@ void *calloc(size_t nmemb, size_t size) {
  * mm_checkheap - So simple, it doesn't need a checker!
  */
 void mm_checkheap(int verbose) {
+    (void) verbose;
 }
