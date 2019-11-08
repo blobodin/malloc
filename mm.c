@@ -25,7 +25,7 @@
 
 /* If you want debugging output, use the following macro.  When you hand
  * in, remove the #define DEBUG line. */
-#define DEBUG
+/* #define DEBUG */
 #ifdef DEBUG
 # define dbg_printf(...) printf(__VA_ARGS__)
 #else
@@ -119,14 +119,9 @@ static bool check_allocated(block_t *block) {
     return (block->header & 0x1) == 1;
 }
 
-static void set_header(block_t *block, size_t size, bool is_allocated) {
-    block->header = size | is_allocated;
+static bool check_allocated_footer(footer_t *footer) {
+    return (footer->footer & 0x1) == 1;
 }
-
-static void set_footer(footer_t *footer, size_t size, bool is_allocated) {
-    footer->footer = size | is_allocated;
-}
-
 
 /*
 * Returns footer of current block.
@@ -137,13 +132,11 @@ static inline footer_t *get_next_footer(block_t *block) {
     return (footer_t *) next_footer;
 }
 
-
 static void set_block(block_t* block, size_t size, bool is_allocated) {
-    set_header(block, size, is_allocated);
+    block->header = size | is_allocated;
     footer_t *footer = get_next_footer(block);
-    set_footer(footer, size, is_allocated);
+    footer->footer = size | is_allocated;
 }
-
 /*
 * Checks if current block is the bottom of the heap.
 * Returns footer of previous block if exists.
@@ -173,12 +166,8 @@ static inline block_t *get_next_header(block_t *block) {
 * Checks if current block is the bottom of the heap.
 * Returns header of previous block if exists.
 */
-static inline block_t *get_prev_header(block_t *block) {
-    footer_t *prev_footer = get_prev_footer(block);
-    if (prev_footer == NULL) {
-        return NULL;
-    }
-    size_t prev_block_size = get_size_footer(prev_footer);
+static inline block_t *get_prev_header(block_t *block, footer_t *footer) {
+    size_t prev_block_size = get_size_footer(footer);
     uint8_t *prev_header = (uint8_t *)block - prev_block_size;
     return (block_t *) prev_header;
 }
@@ -206,32 +195,29 @@ static inline void print_block(block_t *block) {
     printf("FooterAdd:%p\n\n", get_next_footer(block));
 }
 
-static bool split(block_t *curr_block, size_t requested_size) {
-    size_t leftover_payload_size = get_size(curr_block) - requested_size;
-    if (leftover_payload_size >= ALIGNMENT * 2) {
-        uint8_t *second_new_block = ((uint8_t *) curr_block) + requested_size;
-        set_block((block_t *) second_new_block, leftover_payload_size, false);
-        add_to_free((block_t *) second_new_block);
+static void split(block_t *curr_block, size_t requested_size) {
+    uint8_t *second_new_block = ((uint8_t *) curr_block) + requested_size;
+    set_block((block_t *) second_new_block, get_size(curr_block) - requested_size, false);
+    add_to_free((block_t *) second_new_block);
+    block_t *first_new_block = curr_block;
+    set_block(first_new_block, requested_size, true);
 
-        block_t *first_new_block = curr_block;
-        set_block(first_new_block, requested_size, true);
-        return true;
-    }
-    return false;
 }
 
 static void *search_fit(size_t size){
-    size_t block_size = round_up(size, ALIGNMENT);
+    size_t block_size = size;
     list_node_t *curr_node = head_node;
     while (curr_node != NULL) {
-        if (get_size_node(curr_node) >= block_size) {
-            block_t *f_block = (block_t *) ((void *) curr_node);
-            size_t f_size = get_size(f_block);
-            if (split(f_block, block_size) != true) {
-                set_block(f_block, f_size, true);
+        size_t curr_size = get_size_node(curr_node);
+        if (curr_size >= block_size) {
+            block_t *curr_block = (block_t *) ((void *) curr_node);
+            if (curr_size - block_size >= ALIGNMENT * 2) {
+                split(curr_block, block_size);
+            } else {
+                set_block(curr_block, curr_size, true);
             }
-            remove_from_free(f_block);
-            return f_block->payload;
+            remove_from_free(curr_block);
+            return curr_block->payload;
         } else {
             curr_node = curr_node->next;
         }
@@ -246,63 +232,24 @@ static void *search_fit(size_t size){
  */
 void *malloc(size_t size) {
     size_t block_size = round_up(size, ALIGNMENT);
-    void *first_fit = search_fit(size);
+    void *first_fit = search_fit(block_size);
     if (first_fit != NULL) {
         return first_fit;
     }
 
-
-    block_t *block = mem_sbrk(block_size - sizeof(footer_t));
-    footer_t *footer = mem_sbrk(sizeof(footer_t));
-    if ((long) block < 0 || (long) footer < 0) {
+    block_t *block = mem_sbrk(block_size);
+    if ((long) block < 0) {
         return NULL;
     }
 
-    set_header(block, block_size, true);
-    set_footer(footer, block_size, true);
+    set_block(block, block_size, true);
 
     return block->payload;
 }
 
-static block_t *coalesc(block_t *block) {
-    block_t *original_block = block;
-    block_t *prev_block = get_prev_header(original_block);
-    block_t *next_block = get_next_header(original_block);
-
-    size_t prev_valid = 0;
-    if (prev_block != NULL && check_allocated(prev_block) != true) {
-        remove_from_free(prev_block);
-        prev_valid = 1;
-    }
-
-    size_t next_valid = 0;
-    if (next_block != NULL && check_allocated(next_block) != true) {
-        remove_from_free(next_block);
-        next_valid = 1;
-    }
-
-    block_t *new_block = NULL;
-    size_t new_size = 0;
-
-    if (prev_valid == true && next_valid == true) {
-        new_block = prev_block;
-        new_size = get_size(prev_block) + get_size(original_block)
-                    + get_size(next_block);
-    } else if (prev_valid == true && next_valid == false) {
-        new_block = prev_block;
-        new_size = get_size(prev_block) + get_size(original_block);
-    } else if (prev_valid == false && next_valid == true) {
-        new_block = original_block;
-        new_size = get_size(next_block) + get_size(original_block);
-    }
-
-
-    if (new_size != 0) {
-        set_block(new_block, new_size, false);
-        return new_block;
-    }
-
-    return block;
+static void coalesc(block_t *block1, block_t *block2) {
+    size_t new_size = get_size(block1) + get_size(block2);
+    set_block(block1, new_size, false);
 }
 /*
  * free - We don't know how to free a block.  So we ignore this call.
@@ -311,11 +258,24 @@ static block_t *coalesc(block_t *block) {
 void free(void *ptr) {
     if (ptr != NULL) {
         block_t *curr_block = ptr - offsetof(block_t, payload);
-        footer_t *curr_footer = get_next_footer(curr_block);
         size_t size = get_size(curr_block);
-        set_header(curr_block, size, false);
-        set_footer(curr_footer, size, false);
-        add_to_free(coalesc(curr_block));
+        set_block(curr_block, size, false);
+
+        footer_t *prev_footer = get_prev_footer(curr_block);
+        block_t *next_block = get_next_header(curr_block);
+
+        block_t *free_block = curr_block;
+        if (prev_footer && !check_allocated_footer(prev_footer)) {
+            block_t *prev_block = get_prev_header(curr_block, prev_footer);
+            remove_from_free(prev_block);
+            coalesc(prev_block, curr_block);
+            free_block = prev_block;
+        }
+        if (next_block && !check_allocated(next_block)) {
+            remove_from_free(next_block);
+            coalesc(free_block, next_block);
+        }
+        add_to_free(free_block);
     }
 }
 
