@@ -1,13 +1,16 @@
-/*
- * mm-bump.c - The fastest, least memory-efficient malloc package.
+/* Explicit free list malloc implementation:
  *
- * In this naive approach, a block is allocated by simply incrementing
- * the brk pointer.  Blocks are never coalesced or reused.  The size of
- * a block is found at the first aligned word before the block (we need
- * it for realloc).
+ * This implementation of malloc uses an explict free list to iterate
+ * through free allocated memory effectively. First fit is utilized when
+ * searching for a ptr to return, and FIFO is utilized when adding to the
+ * free list itself.
  *
- * This code is correct and blazingly fast, but very bad usage-wise since
- * it never frees anything.
+ * Headers and footers are used to effectively coalesce and split blocks
+ * when necessary. Splitting will occur if possible upon finding a valid
+ * block to return in malloc. If possible, coalescing occurs during free
+ * when it is called.
+ *
+ * This implementation has a good balance of utilization and throughput.
  */
 #include <assert.h>
 #include <stdio.h>
@@ -45,6 +48,11 @@
 #define ALIGNMENT (2 * sizeof(size_t))
 #define HEAPBOUND ((size_t) pow(2, 64))
 
+/*
+ * This struct is the basis for the implicit list. The payload is the
+ * memory to be used by the user. The header is used to keep the size of the
+ * entire block (including its footer).
+ */
 typedef struct {
     size_t header;
     /*
@@ -55,19 +63,31 @@ typedef struct {
     uint8_t payload[];
 } block_t;
 
+/*
+ * This struct is an extension of the block structure. The footer is
+ * used to keep the size of the entire block (including its header).
+ */
 typedef struct {
     size_t footer;
 } footer_t;
 
-
+/*
+ * This struct is the basis for the free list. Freed blocks are cast to
+ * this type. In this way, free nodes are in the same memory space as it
+ * freed block counterpart. The space previously used for the payload is
+ * instead used for prev and next pointers.
+ */
 typedef struct list_node_t{
     size_t header;
     struct list_node_t *prev;
     struct list_node_t *next;
 } list_node_t;
 
+/* Global variable for the free list. */
 list_node_t *head_node = NULL;
 
+/* Takes a freed block and adds its node counterpart to the beginning
+ * of the freed list. */
 static void add_to_free(block_t *block) {
     list_node_t *new_node = (list_node_t *) ((void *) block);
     new_node->prev = NULL;
@@ -79,6 +99,7 @@ static void add_to_free(block_t *block) {
     head_node = new_node;
 }
 
+/* Takes a used block and removes its node counterpart from the free list.*/
 static void remove_from_free(block_t *block) {
     list_node_t *remove_block= (list_node_t *) ((void *) block);
 
@@ -96,6 +117,11 @@ static void remove_from_free(block_t *block) {
 
 }
 
+/* Rounds the requested paylaod size to a multiple of 16 so as to keep
+ * the payload addresses 16 byte aligned. Because the notion of
+ * size in the header and footer is the size of the entire block
+ * (i.e. header, payload, and footer) these are added to the payload size
+ * before returning.*/
 static size_t round_up(size_t size, size_t n) {
     if (size % n == 0) {
         return size + sizeof(block_t) + sizeof(footer_t);
@@ -103,22 +129,27 @@ static size_t round_up(size_t size, size_t n) {
     return ((size + n - 1) / n * n) + sizeof(block_t) + sizeof(footer_t);
 }
 
+/* Helper function to get size of block from header. */
 static size_t get_size(block_t *block) {
     return block->header & ~0x1;
 }
 
-static size_t get_size_node(list_node_t *node) {
-    return node->header & ~0x1;
-}
-
+/* Helper function to get size of block from footer. */
 static size_t get_size_footer(footer_t *footer) {
     return footer->footer & ~0x1;
 }
 
+/* Helper function to get size of block from node type. */
+static size_t get_size_node(list_node_t *node) {
+    return node->header & ~0x1;
+}
+
+/* Helper function to check if a block is allocated via its header. */
 static bool check_allocated(block_t *block) {
     return (block->header & 0x1) == 1;
 }
 
+/* Helper function to check if a block is allocated via its footer. */
 static bool check_allocated_footer(footer_t *footer) {
     return (footer->footer & 0x1) == 1;
 }
@@ -143,7 +174,7 @@ static void set_block(block_t* block, size_t size, bool is_allocated) {
 */
 static inline footer_t *get_prev_footer(block_t *block) {
     uint8_t *curr_block = (uint8_t *) block;
-    if (curr_block == mem_heap_lo() + (ALIGNMENT - offsetof(block_t, payload))) {
+    if (curr_block == mem_heap_lo() + offsetof(block_t, payload)) {
         return NULL;
     }
     uint8_t *prev_footer = curr_block - sizeof(footer_t);
@@ -163,8 +194,7 @@ static inline block_t *get_next_header(block_t *block) {
 }
 
 /*
-* Checks if current block is the bottom of the heap.
-* Returns header of previous block if exists.
+* Returns header of previous block.
 */
 static inline block_t *get_prev_header(block_t *block, footer_t *footer) {
     size_t prev_block_size = get_size_footer(footer);
@@ -176,10 +206,10 @@ static inline block_t *get_prev_header(block_t *block, footer_t *footer) {
  * mm_init - Called when a new trace starts.
  */
 int mm_init(void) {
-    /* Pad heap start so first payload is at ALIGNMENT. */
-
+    /* Re-initializes free list global variable. */
     head_node = NULL;
 
+    /* Pad heap start so first payload is at ALIGNMENT. */
     if ((long) mem_sbrk(ALIGNMENT - offsetof(block_t, payload)) < 0) {
         return -1;
     }
@@ -187,23 +217,23 @@ int mm_init(void) {
     return 0;
 }
 
-static inline void print_block(block_t *block) {
-    printf("BLOCk:%p\n", block);
-    printf("Header:%zu\n", block->header);
-    printf("PayloadAdd:%p\n", block->payload);
-    printf("Footer:%zu\n", get_next_footer(block)->footer);
-    printf("FooterAdd:%p\n\n", get_next_footer(block));
-}
-
+/*
+ * Split a free block into two blocks, one with the requested size and
+ * one with the leftover memory. The first block is set to allocated since
+ * it will be used.
+ */
 static void split(block_t *curr_block, size_t requested_size) {
     uint8_t *second_new_block = ((uint8_t *) curr_block) + requested_size;
     set_block((block_t *) second_new_block, get_size(curr_block) - requested_size, false);
     add_to_free((block_t *) second_new_block);
     block_t *first_new_block = curr_block;
     set_block(first_new_block, requested_size, true);
-
 }
 
+/*
+ * Searches for first block in the free list that has a size greater than or
+ * equal to the requested size. A split is done if possible, and the
+ * resulting payload is returned. */
 static void *search_fit(size_t size){
     size_t block_size = size;
     list_node_t *curr_node = head_node;
@@ -227,8 +257,10 @@ static void *search_fit(size_t size){
 }
 
 /*
- * malloc - Allocate a block by incrementing the brk pointer.
+ * malloc - Search for a block in the free list meets the requested size.
  *      Always allocate a block whose size is a multiple of the alignment.
+ *      Allocates a new block with mem_sbrk if no valid block is found in the
+ *      free list.
  */
 void *malloc(size_t size) {
     size_t block_size = round_up(size, ALIGNMENT);
@@ -247,13 +279,17 @@ void *malloc(size_t size) {
     return block->payload;
 }
 
+/* Coalesces a block with the next block in memory. Blocks are all multiples of
+ * 16 so we know that the resulting block will be valid. */
 static void coalesc(block_t *block1, block_t *block2) {
     size_t new_size = get_size(block1) + get_size(block2);
     set_block(block1, new_size, false);
 }
+
 /*
- * free - We don't know how to free a block.  So we ignore this call.
- *      Computers have big memories; surely it won't be a problem.
+ * Frees the requested payload, adding the memory to the free list in the
+ * process. The blocks to the left and right are coalesced with the
+ * original block if possible.
  */
 void free(void *ptr) {
     if (ptr != NULL) {
@@ -333,8 +369,17 @@ void *calloc(size_t nmemb, size_t size) {
     return new_ptr;
 }
 
+/* Prints the relevant information of a memory block stucture (for debugging)*/
+static inline void print_block(block_t *block) {
+    printf("BLOCk:%p\n", block);
+    printf("Header:%zu\n", block->header);
+    printf("PayloadAdd:%p\n", block->payload);
+    printf("Footer:%zu\n", get_next_footer(block)->footer);
+    printf("FooterAdd:%p\n\n", get_next_footer(block));
+}
+
 /*
- * mm_checkheap - So simple, it doesn't need a checker!
+ * 
  */
 void mm_checkheap(int verbose) {
     block_t *curr_block = mem_heap_lo() + offsetof(block_t, payload);
