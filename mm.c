@@ -10,6 +10,15 @@
  * block to return in malloc. If possible, coalescing occurs during free
  * when it is called.
  *
+ * The notion of size in free nodes and blocks is the entire size of the block
+ * (i.e. the size of the header, the size of the footer, the size of the
+ * payload). Size_t is used in header and footer so that the allocator works
+ * for heaps up to 2^64 byets.
+ *
+ * Free nodes contain the size of the unallocated block in memory, a prev
+ * pointer, and a next pointer. Blocks have a header and payload. A separate
+ * footer struct ends each block.
+ *
  * This implementation has a good balance of utilization and throughput.
  */
 #include <assert.h>
@@ -93,6 +102,8 @@ static void add_to_free(block_t *block) {
     new_node->prev = NULL;
 
     new_node->next = head_node;
+
+    /* This is the case where the list is empty. */
     if (head_node != NULL) {
         head_node->prev = new_node;
     }
@@ -106,11 +117,14 @@ static void remove_from_free(block_t *block) {
     list_node_t *prev_node = remove_block->prev;
     list_node_t *next_node = remove_block->next;
 
+    /* This checks if its the first node. */
     if (prev_node != NULL) {
         prev_node->next = next_node;
     } else {
         head_node = next_node;
     }
+
+    /* This checks if its the last node. */
     if (next_node != NULL) {
         next_node->prev = prev_node;
     }
@@ -163,13 +177,15 @@ static inline footer_t *get_next_footer(block_t *block) {
     return (footer_t *) next_footer;
 }
 
+/* Sets header and footer of block. */
 static void set_block(block_t* block, size_t size, bool is_allocated) {
     block->header = size | is_allocated;
     footer_t *footer = get_next_footer(block);
     footer->footer = size | is_allocated;
 }
+
 /*
-* Checks if current block is the bottom of the heap.
+* Checks if current block is the bottom of the heap (since no prologue is used)
 * Returns footer of previous block if exists.
 */
 static inline footer_t *get_prev_footer(block_t *block) {
@@ -182,7 +198,7 @@ static inline footer_t *get_prev_footer(block_t *block) {
 }
 
 /*
-* Checks if current block is the top of the heap.
+* Checks if current block is the top of the heap (since no epilogue is used)
 * Returns header of next block if exists.
 */
 static inline block_t *get_next_header(block_t *block) {
@@ -223,8 +239,12 @@ int mm_init(void) {
  * it will be used.
  */
 static void split(block_t *curr_block, size_t requested_size) {
+    /* Forms a new block out of the memory leftover. */
     uint8_t *second_new_block = ((uint8_t *) curr_block) + requested_size;
-    set_block((block_t *) second_new_block, get_size(curr_block) - requested_size, false);
+    size_t leftover_size = get_size(curr_block) - requested_size;
+    set_block((block_t *) second_new_block, leftover_size, false);
+
+    /* Forms a new block of the requested memory size. */
     add_to_free((block_t *) second_new_block);
     block_t *first_new_block = curr_block;
     set_block(first_new_block, requested_size, true);
@@ -233,14 +253,20 @@ static void split(block_t *curr_block, size_t requested_size) {
 /*
  * Searches for first block in the free list that has a size greater than or
  * equal to the requested size. A split is done if possible, and the
- * resulting payload is returned. */
+ * resulting payload is returned.
+ */
 static void *search_fit(size_t size){
     size_t block_size = size;
     list_node_t *curr_node = head_node;
     while (curr_node != NULL) {
         size_t curr_size = get_size_node(curr_node);
+        /* Checks if curr free node fits the requested size. */
         if (curr_size >= block_size) {
             block_t *curr_block = (block_t *) ((void *) curr_node);
+            /*
+             * Checks if leftover memory is big enough for another
+             * block (i.e checks if a split can occur).
+             */
             if (curr_size - block_size >= ALIGNMENT * 2) {
                 split(curr_block, block_size);
             } else {
@@ -265,10 +291,13 @@ static void *search_fit(size_t size){
 void *malloc(size_t size) {
     size_t block_size = round_up(size, ALIGNMENT);
     void *first_fit = search_fit(block_size);
+
+    /* If a valid block is found in the free list, return it. */
     if (first_fit != NULL) {
         return first_fit;
     }
 
+    /* If a valid block is not found in the free list, make a new one. */
     block_t *block = mem_sbrk(block_size);
     if ((long) block < 0) {
         return NULL;
@@ -300,17 +329,25 @@ void free(void *ptr) {
         footer_t *prev_footer = get_prev_footer(curr_block);
         block_t *next_block = get_next_header(curr_block);
 
+        /* Keeps track of final free block address to return. This variable
+         * may change if coalescing occurs. */
         block_t *free_block = curr_block;
+
+        /* Checks if coalescing can occur between the left and middle blocks.*/
         if (prev_footer && !check_allocated_footer(prev_footer)) {
             block_t *prev_block = get_prev_header(curr_block, prev_footer);
             remove_from_free(prev_block);
             coalesc(prev_block, curr_block);
             free_block = prev_block;
         }
+
+        /* Checks if coalescing can occur between the right and middle blocks.*/
         if (next_block && !check_allocated(next_block)) {
             remove_from_free(next_block);
             coalesc(free_block, next_block);
         }
+
+        /* Adds resulting free block to free list. */
         add_to_free(free_block);
     }
 }
@@ -371,7 +408,7 @@ void *calloc(size_t nmemb, size_t size) {
 
 /* Prints the relevant information of a memory block stucture (for debugging)*/
 static inline void print_block(block_t *block) {
-    printf("BLOCk:%p\n", block);
+    printf("BlockAdd:%p\n", block);
     printf("Header:%zu\n", block->header);
     printf("PayloadAdd:%p\n", block->payload);
     printf("Footer:%zu\n", get_next_footer(block)->footer);
@@ -379,73 +416,109 @@ static inline void print_block(block_t *block) {
 }
 
 /*
- * 
+ * A debugging tool for checking the status of the heap and free list.
+ *
+ * Current Functionality:
+ *     Checks each block's address alignment.
+ *     Checks header/footer equality, alignment, and size
+ *     Checks coalescing
+ *     Checks consistency of prev/next pointers
+ *     Checks that free list pointers are within the heap
+ *     Checks that num free blocks matches size of free list
+ *
+ * (Note: Epilogues and prologues are not used, so they do not need to be
+ * checked)
  */
 void mm_checkheap(int verbose) {
     block_t *curr_block = mem_heap_lo() + offsetof(block_t, payload);
+
+    /* Free counter is used to keep track of consecutive free blocks. */
     size_t free_counter = 0;
-    size_t counter = 0;
-    size_t total_free_counter = 0;
+
+    /* Free block counter counts the total num of unallocated blocks. */
+    size_t free_block_counter = 0;
+
+    /* Iterates through all blocks in heap. */
     while (curr_block != NULL) {
+        /* Checks each block's address alignment. */
         if (((uint8_t) curr_block->payload) % 16 != 0) {
             printf("Alignment Off :%i\n", verbose);
             print_block(curr_block);
-            printf("%zu\n", counter);
+            exit(0);
         }
+
+        /* Checks that header and footers of a block match. */
         size_t curr_header = curr_block->header;
         size_t curr_footer = get_next_footer(curr_block)->footer;
         if (curr_header != curr_footer) {
             printf("Header/Footer Don't Match %i\n", verbose);
             print_block((block_t *) curr_block);
-            printf("%zu\n", counter);
+            exit(0);
         }
+
+        if (curr_header < ALIGNMENT * 2) {
+            printf("Block below minimum size %i\n", verbose);
+            exit(0);
+        }
+
+        /* Checks coalescing (no two consecutive free blocks) and counts total
+         * free nodes in list. */
         if (check_allocated(curr_block) == false) {
             free_counter++;
-            total_free_counter++;
-
+            free_block_counter++;
             if (free_counter == 2) {
                 printf("Two Consecutive Free Blocks %i\n", verbose);
-                free_counter = 1;
+                exit(0);
             }
         } else {
             free_counter = 0;
         }
 
         curr_block = get_next_header(curr_block);
-        counter++;
     }
 
-    size_t other_free_counter = 0;
+    /* Free node counter counts the total num of nodes in free list. */
+    size_t free_node_counter = 0;
     list_node_t *curr_node = head_node;
+
+    /* Iterates through all nodes in free list. */
     while (curr_node != NULL) {
+        /* Checks that prev and next pointers are consistent. */
         list_node_t *prev_node = curr_node->prev;
         list_node_t *next_node = curr_node->next;
         if (next_node != NULL) {
             if (next_node->prev != curr_node) {
                 printf("Prev pointer of next wrong %i\n", verbose);
+                exit(0);
             }
         }
         if (prev_node != NULL) {
             if (prev_node->next != curr_node) {
                 printf("Next pointer of prev wrong %i\n", verbose);
+                exit(0);
             }
         }
-        if ((void *) curr_node <= mem_heap_lo() + 7) {
+
+        /* Checks that free list pointers are within the heap. */
+        if ((uint8_t *) curr_node <= (uint8_t *) mem_heap_lo() + 7) {
             printf("Node below bottom of heap %i\n", verbose);
-            printf("Node below bottom of heap %p\n", curr_node);
-            if ((uint8_t *) curr_node + get_size((block_t *) curr_node) > (uint8_t *) mem_heap_hi() - 1){
+            if ((uint8_t *) curr_node + get_size((block_t *) curr_node)
+                > (uint8_t *) mem_heap_hi() - 1){
                 printf("Node above top of heap %i\n", verbose);
-                printf("Node above top of heap %p\n", curr_node);
+                exit(0);
             }
+            exit(0);
         }
         curr_node = curr_node->next;
-        other_free_counter++;
+        free_node_counter++;
     }
 
-    /*if (total_free_counter != other_free_counter) {
+    /* Checks that all unallocated blocks are in the free list. */
+    if (free_block_counter != free_node_counter) {
         printf("Free mismatch %i\n", verbose);
-        printf("NODE %zu\n", other_free_counter);
-        printf("IMPLICIT %zu\n", total_free_counter);
-    }*/
+        printf("BLOCK: %zu\n", free_block_counter);
+        printf("NODE: %zu\n", free_node_counter);
+        exit(0);
+    }
 
 }
